@@ -1,0 +1,173 @@
+name: 月次レポートの作成
+
+# 毎月1日に、大きな更新が出ているパッケージと、まだ直っていないセキュリティ
+# アラートをまとめて、Issueとして報告する。
+on:
+  schedule:
+    # 毎月1日 20:00 JST = 同日 11:00 UTC
+    - cron: '0 11 1 * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+  security-events: read
+
+jobs:
+  monthly-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリを取得
+        uses: actions/checkout@v7
+
+      - name: Node.jsをセットアップ
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'yarn'
+
+      - name: 依存パッケージをインストール
+        run: yarn install --frozen-lockfile
+
+      - name: 大きな更新が出ているパッケージを調べる
+        run: npm outdated --json > /tmp/outdated.json || true
+
+      - name: Dependabotアラートを取得
+        id: alerts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh api "repos/${{ github.repository }}/dependabot/alerts" --paginate --jq '[.[] | select(.state=="open")]' > /tmp/alerts.json 2>/tmp/alerts_err.txt; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            cat /tmp/alerts_err.txt
+          fi
+
+      - name: (取得できなかった場合の代わりに) yarn auditで調べる
+        if: steps.alerts.outputs.ok == 'false'
+        run: yarn audit --json > /tmp/yarn-audit.json || true
+
+      - name: レポートの文章を作成
+        id: build
+        run: |
+          cat > /tmp/build-report.mjs <<'SCRIPT'
+          import { readFileSync, existsSync, writeFileSync } from 'node:fs';
+
+          // 大きな更新（メジャーバージョンが上がるもの）を調べる
+          let outdated = {};
+          try {
+            const raw = readFileSync('/tmp/outdated.json', 'utf8').trim();
+            if (raw) outdated = JSON.parse(raw);
+          } catch {}
+          const majorUpdates = [];
+          for (const [name, info] of Object.entries(outdated)) {
+            if (!info.current || !info.latest) continue;
+            const curMajor = parseInt(info.current.split('.')[0], 10);
+            const latestMajor = parseInt(info.latest.split('.')[0], 10);
+            if (!Number.isNaN(curMajor) && !Number.isNaN(latestMajor) && latestMajor > curMajor) {
+              majorUpdates.push({ name, current: info.current, latest: info.latest });
+            }
+          }
+
+          let body = '';
+          body += '## 大きな更新が出ているパッケージ\n';
+          body += '自動更新の対象外になっている、大きなバージョンアップ（メジャーアップデート）の一覧です。中身が大きく変わっている可能性があるため、内容を確認してから手動で更新してください。\n\n';
+          if (majorUpdates.length === 0) {
+            body += '現在、大きな更新はありません。\n\n';
+          } else {
+            body += '| パッケージ名 | 今のバージョン | 最新のバージョン |\n';
+            body += '|---|---|---|\n';
+            for (const u of majorUpdates) {
+              body += `| ${u.name} | ${u.current} | ${u.latest} |\n`;
+            }
+            body += '\n';
+          }
+
+          // セキュリティアラートを調べる
+          body += '## セキュリティの注意（Dependabotアラート）\n';
+          body += 'GitHubが検知している、まだ直っていないセキュリティ上の注意点です。\n\n';
+
+          const alertsOk = process.env.ALERTS_OK === 'true';
+          if (alertsOk && existsSync('/tmp/alerts.json')) {
+            let alerts = [];
+            try {
+              alerts = JSON.parse(readFileSync('/tmp/alerts.json', 'utf8'));
+            } catch {}
+            if (alerts.length === 0) {
+              body += '現在、開いているセキュリティアラートはありません。\n\n';
+            } else {
+              body += '| パッケージ名 | 深刻度 | 概要 |\n';
+              body += '|---|---|---|\n';
+              for (const a of alerts) {
+                const pkg = a.dependency?.package?.name ?? '不明';
+                const severity = a.security_advisory?.severity ?? '不明';
+                const summary = (a.security_advisory?.summary ?? '').replace(/\|/g, '\\|');
+                body += `| ${pkg} | ${severity} | ${summary} |\n`;
+              }
+              body += '\n';
+            }
+          } else if (existsSync('/tmp/yarn-audit.json')) {
+            body += '（今回は権限の都合でDependabotアラートを直接取得できなかったため、代わりにyarnの脆弱性チェック（yarn audit）で調べた結果を載せています）\n\n';
+            const lines = readFileSync('/tmp/yarn-audit.json', 'utf8').split('\n').filter(Boolean);
+            const advisories = [];
+            for (const line of lines) {
+              try {
+                const obj = JSON.parse(line);
+                if (obj.type === 'auditAdvisory') {
+                  const d = obj.data.advisory;
+                  advisories.push({ pkg: d.module_name, severity: d.severity, summary: d.title });
+                }
+              } catch {}
+            }
+            if (advisories.length === 0) {
+              body += '現在、yarn auditで検知された脆弱性はありません。\n\n';
+            } else {
+              body += '| パッケージ名 | 深刻度 | 概要 |\n';
+              body += '|---|---|---|\n';
+              for (const a of advisories) {
+                body += `| ${a.pkg} | ${a.severity} | ${a.summary} |\n`;
+              }
+              body += '\n';
+            }
+          } else {
+            body += '今回はセキュリティアラートを取得できませんでした（権限の都合、または通信エラーの可能性があります）。GitHubのリポジトリ画面の「Security」タブから直接ご確認ください。\n\n';
+          }
+
+          body += '---\n';
+          body += 'このレポートは、依存パッケージの自動更新の仕組みによって毎月1日に自動で作成されています。\n';
+
+          writeFileSync('/tmp/issue-body.md', body);
+          SCRIPT
+          ALERTS_OK="${{ steps.alerts.outputs.ok }}" node /tmp/build-report.mjs
+          cat /tmp/issue-body.md
+
+      - name: 前の月のレポートIssueがあれば閉じる
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cur_year=$(TZ=Asia/Tokyo date +%Y)
+          cur_month=$(TZ=Asia/Tokyo date +%-m)
+          if [ "$cur_month" = "1" ]; then
+            prev_year=$((cur_year - 1))
+            prev_month=12
+          else
+            prev_year=$cur_year
+            prev_month=$((cur_month - 1))
+          fi
+          prev_title="月次レポート ${prev_year}年${prev_month}月"
+          echo "prev_title=$prev_title"
+          gh issue list --state open --search "\"$prev_title\" in:title" --json number,title \
+            --jq ".[] | select(.title == \"$prev_title\") | .number" | while read -r num; do
+            echo "Issue #$num を閉じます"
+            gh issue close "$num" --comment "翌月のレポートを作成したため閉じます"
+          done
+
+      - name: 今月のレポートIssueを作成
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cur_year=$(TZ=Asia/Tokyo date +%Y)
+          cur_month=$(TZ=Asia/Tokyo date +%-m)
+          cur_title="月次レポート ${cur_year}年${cur_month}月"
+          gh issue create --title "$cur_title" --body-file /tmp/issue-body.md

@@ -1,0 +1,138 @@
+name: 依存パッケージの自動更新
+
+# package.jsonに書かれた範囲(^や~)の中で、依存パッケージを毎日自動で
+# 最新版に更新する。ビルドとテストが通ったときだけmasterへ直接反映する。
+on:
+  schedule:
+    # 毎日20:00 JST = 11:00 UTC
+    - cron: '0 11 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  self-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 平日の9時〜17時(JST)なら何もせず終了する
+        id: guard
+        run: |
+          hour=$(TZ=Asia/Tokyo date +%-H)
+          dow=$(TZ=Asia/Tokyo date +%u)  # 1=月曜 ... 7=日曜
+          if [ "$dow" -le 5 ] && [ "$hour" -ge 9 ] && [ "$hour" -lt 17 ]; then
+            echo "平日の9時〜17時(JST)のため、何もせず終了します"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: リポジトリを取得
+        if: steps.guard.outputs.skip == 'false'
+        uses: actions/checkout@v7
+
+      - name: Node.jsをセットアップ
+        if: steps.guard.outputs.skip == 'false'
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'yarn'
+
+      - name: 依存パッケージをインストール
+        if: steps.guard.outputs.skip == 'false'
+        run: yarn install --frozen-lockfile
+
+      - name: package.jsonの範囲内で依存パッケージを最新にする
+        if: steps.guard.outputs.skip == 'false'
+        run: yarn upgrade
+
+      - name: 更新があったかを確認
+        if: steps.guard.outputs.skip == 'false'
+        id: diff
+        run: |
+          if git diff --quiet -- yarn.lock; then
+            echo "更新はありませんでした"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "更新がありました"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 守り続けるバージョンを満たしているか確認
+        if: steps.guard.outputs.skip == 'false' && steps.diff.outputs.changed == 'true'
+        run: |
+          cat > /tmp/check-versions.mjs <<'SCRIPT'
+          import { readFileSync } from 'node:fs';
+          const lock = readFileSync('yarn.lock', 'utf8');
+          const blocks = lock.split(/\n\n+/);
+          const targets = {
+            'js-yaml': { min: [4, 3, 2], optional: true },
+            'browserslist': { min: [4, 28, 7], optional: true },
+            'postcss-selector-parser': { min: [6, 1, 3], optional: false },
+            'next': { min: [15, 5, 24], optional: false },
+            'postcss': { min: [8, 5, 26], optional: false },
+            'nanoid': { min: [3, 3, 19], optional: false },
+          };
+          function cmp(a, b) {
+            for (let i = 0; i < 3; i++) {
+              const d = (a[i] || 0) - (b[i] || 0);
+              if (d !== 0) return d;
+            }
+            return 0;
+          }
+          let failed = false;
+          for (const [name, cfg] of Object.entries(targets)) {
+            const found = [];
+            for (const block of blocks) {
+              const lines = block.split('\n');
+              const header = lines[0];
+              if (!header || !header.trim().endsWith(':')) continue;
+              const specs = header
+                .slice(0, header.lastIndexOf(':'))
+                .split(',')
+                .map((s) => s.trim().replace(/^"|"$/g, ''));
+              const matches = specs.some((s) => s === name || s.startsWith(name + '@'));
+              if (!matches) continue;
+              const vLine = lines.find((l) => l.trim().startsWith('version '));
+              if (!vLine) continue;
+              const m = vLine.match(/version "([^"]+)"/);
+              if (m) found.push(m[1]);
+            }
+            if (found.length === 0) {
+              if (!cfg.optional) {
+                console.error(`NG: ${name} が依存に見つかりません（必須パッケージ）`);
+                failed = true;
+              } else {
+                console.log(`OK: ${name} は依存にありません`);
+              }
+              continue;
+            }
+            for (const v of found) {
+              const parts = v.split('.').map(Number);
+              if (cmp(parts, cfg.min) < 0) {
+                console.error(`NG: ${name}@${v} は目標の ${cfg.min.join('.')} 未満です`);
+                failed = true;
+              } else {
+                console.log(`OK: ${name}@${v}`);
+              }
+            }
+          }
+          if (failed) process.exit(1);
+          SCRIPT
+          node /tmp/check-versions.mjs
+
+      - name: ビルドとテストを実行
+        if: steps.guard.outputs.skip == 'false' && steps.diff.outputs.changed == 'true'
+        timeout-minutes: 10
+        run: yarn test
+
+      - name: 更新をmasterへ直接コミットしてpush
+        if: steps.guard.outputs.skip == 'false' && steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add yarn.lock
+          git commit -m "⬆️ 依存パッケージを小さな更新の最新版に自動更新
+
+          Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+          git push origin HEAD:main
